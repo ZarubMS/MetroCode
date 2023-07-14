@@ -90,11 +90,10 @@ def run():
     df1 = df1.join(df, (df1.dag_id == df.dag_id_df), 'inner')
     df1 = df1.drop('dag_id_df')
 
-    #Получаем даги и родителей 1ого порядка
+    #Получаем даги, родителей(df3) и зависимые(df2) 1ого порядка
     columns = ['dest_dag_nm', 'source_dag_nm']
     df2 = get_data('airflow_data.dependency_trees', columns)
     
-    #Получаем даги и зависимые 1ого порядка
     df3 = df2.withColumnRenamed('dest_dag_nm', 'depend_dag_nm').withColumnRenamed('source_dag_nm', 'dest_dag_nm_1')
     df3 = df3.distinct().filter(F.col('dest_dag_nm_1').isNotNull())
     df3 = df3.groupBy('dest_dag_nm_1').agg(F.collect_list('depend_dag_nm').alias('depend_dags_nm'))
@@ -103,7 +102,6 @@ def run():
     df2 = df2.distinct()
     df2 = df2.groupBy('dest_dag_nm').agg(F.collect_list('source_dag_nm').alias('source_dags_nm'))
     df2 = df2.drop('source_dag_nm')
-    df2 = df2.orderBy('dest_dag_nm')
 
     #Джойним родителей и зависимые к (dag_id, start_date, end_date, execution_date, execution_end_date, schedule_interval, periodicity)
     df1 = df1.join(df2, (df1.dag_id == df2.dest_dag_nm), 'left').join(df3, (df1.dag_id == df3.dest_dag_nm_1), 'left')
