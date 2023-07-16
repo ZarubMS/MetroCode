@@ -47,9 +47,84 @@ def cron_type(cron):
         else:
             periodicity = 'неизвестно'
         return periodicity   
-      
+    
+#Получаем датафрейм dag_id, schedule_interval, periodicity из public_stg.dag
+def df_from_publicstgdag():
+    #Получаем даги и крон в датафрейм
+    columns = ['dag_id', 'is_paused', 'is_active', 'schedule_interval']
+    df = get_data('public_stg.dag', columns)
+    df = df.filter((df.is_paused  == 'false') & (df.is_active  == 'true'))
+    df = df.select(df.dag_id.alias('dag_id_df'), df.schedule_interval)
+    #Добавляем колонку с вычесленной периодичностью
+    convertUDF = F.udf(lambda z: cron_type(z), StringType())
+    df = df.withColumn('periodicity', cron_type(F.col('schedule_interval')))
+    df = df.filter(F.col('periodicity') != 'ежеминутный')
+    df.show(5)
+    return df
 
+#Получаем dag_id, start_date, end_date, execution_date, execution_end_date
+def df_from_airflowdatadagrun(date_from, date_to):
+        #Получаем даги, фактическое время работы и планируемый старт 
+    columns = ['dag_id', 'start_date', 'end_date', 'execution_date']
+    df = get_data('airflow_data.dag_run', columns)
+    #Отфильтровываем даги которые попадают в период полученный из командной строки
+    df = df.withColumn('start_interval', F.lit(date_from)).withColumn('end_interval', F.lit(date_to))
+    df = df.filter((F.unix_timestamp('start_date') > F.unix_timestamp('start_interval')) & \
+                     (F.unix_timestamp('end_date') <= F.unix_timestamp('end_interval')))
+    #Добавляем колонку с планируемым временем окончания работы дага 
+    df = df.withColumn('execution_end_date', F.to_timestamp(F.from_unixtime(F.unix_timestamp('execution_date').cast('long') \
+                                                                + F.unix_timestamp('end_date').cast('long') \
+                                                                - F.unix_timestamp('start_date').cast('long'))))
+    df.show(5)
+    return df
 
+def df_from_airflowdatadependencytrees():
+    #Получаем даги, родителей и зависимые 1ого порядка
+    columns = ['dest_dag_nm', 'source_dag_nm']
+    df = get_data('airflow_data.dependency_trees', columns)
+    df1 = df.withColumnRenamed('dest_dag_nm', 'depend_dag_nm').withColumnRenamed('source_dag_nm', 'dest_dag_nm_1')
+    df1 = df1.distinct().filter(F.col('dest_dag_nm_1').isNotNull())
+    df1 = df1.groupBy('dest_dag_nm_1').agg(F.collect_set('depend_dag_nm').alias('depend_dags_nm'))
+    df1 = df1.drop('depend_dag_nm')
+    df = df.distinct()
+    df = df.groupBy('dest_dag_nm').agg(F.collect_set('source_dag_nm').alias('source_dags_nm'))
+    df = df.drop('source_dag_nm')
+    #Джойним родителей и зависимые
+    df = df.join(df1, (df.dest_dag_nm == df1.dest_dag_nm_1), 'left')
+    #Преобразуем в списки родительских и зависимых дагов строки 
+    df = df.withColumn('source_dags', F.concat_ws(' ', 'source_dags_nm')).withColumn('depend_dags', F.concat_ws(' ', 'depend_dags_nm'))
+    df = df.drop('source_dags_nm', 'depend_dags_nm', 'dest_dag_nm_1')
+    df.show(5)
+    return df
+
+#Джойним три датафрейма, разделяем получившийся на два с реальным временем и планируемым и объединяем в один через юнион
+def result_frame(df, df1, df2):
+    df = df.join(df1, (df.dag_id == df1.dag_id_df), 'inner').join(df2, (df.dag_id == df2.dest_dag_nm), 'inner')
+    df1 = df.select(F.concat(F.col('dag_id'), F.lit('_'), F.lit('plan')).alias('dag_id'),
+                     'execution_date',
+                     'execution_end_date',
+                     'schedule_interval',
+                     'periodicity', 'source_dags', 'depend_dags')
+    df = df.drop('dest_dag_nm', 'dag_id_df', 'execution_date', 'execution_end_date', 'start_interval', 'end_interval')
+    df = df.union(df1)
+    df.show(5)
+    return df
+
+def write_to_vertica(df):
+    #Записываем в вертику
+    spark = SparkSession.builder.enableHiveSupport().getOrCreate()
+    gw = spark.sparkContext._gateway
+    java_import(gw.jvm, "VerticaDialect")
+    gw.jvm.org.apache.spark.sql.jdbc.JdbcDialects.registerDialect(gw.jvm.VerticaDialect())
+    df.write.format('jdbc') \
+        .option("url", "jdbc:vertica://10.220.126.48:5433/") \
+        .option("driver", "com.vertica.jdbc.Driver") \
+        .option("dbtable", "public.dags_schedule") \
+        .option("database", "TST") \
+        .option("user", "dbadmin") \
+        .option("password", "TSTpassword") \
+        .mode("append") \
+        .save()
 
 
 
@@ -61,94 +136,12 @@ def run():
     date_from = datetime.strptime(args['date_from'] + ' '+'00:00', dt_fmt)
     date_to = datetime.strptime(args['date_to'] + ' '+'00:00', dt_fmt)
     
-
-    #Получаем даги и крон в датафрейм
-    columns = ['dag_id', 'is_paused', 'is_active', 'schedule_interval']
-    df = get_data('public_stg.dag', columns)
-    df = df.filter((df.is_paused  == 'false') & (df.is_active  == 'true'))
-    df = df.drop('is_paused', 'is_active')
-    df = df.select(df.dag_id.alias('dag_id_df'), df.schedule_interval)
-    #Добавляем колонку с вычесленной периодичностью
-    convertUDF = F.udf(lambda z: cron_type(z), StringType())
-    df = df.withColumn('periodicity', cron_type(F.col('schedule_interval')))
-    df = df.filter(F.col('periodicity') != 'ежеминутный')
-
-    #Получаем даги, фактическое время работы и планируемый старт 
-    columns = ['dag_id', 'start_date', 'end_date', 'execution_date']
-    df1 = get_data('airflow_data.dag_run', columns)
-
-    #Отфильтровываем даги которые попадают в период полученный из командной строки
-    df1 = df1.withColumn('start_interval', F.lit(date_from)).withColumn('end_interval', F.lit(date_to))
-    df1 = df1.filter((F.unix_timestamp('start_date') > F.unix_timestamp('start_interval')) & (F.unix_timestamp('end_date') <= F.unix_timestamp('end_interval')))
-
-
-    #Добавляем колонку с планируемым временем окончания работы дага 
-    df1 = df1.withColumn('execution_end_date', F.to_timestamp(F.from_unixtime(F.unix_timestamp('execution_date').cast('long') \
-                                                                + F.unix_timestamp('end_date').cast('long') \
-                                                                - F.unix_timestamp('start_date').cast('long'))))
-    #Джойним (dag_id, start_date, end_date, execution_date, execution_end_date, schedule_interval, periodicity)
-    df1 = df1.join(df, (df1.dag_id == df.dag_id_df), 'inner')
-    df1 = df1.drop('dag_id_df')
-
-    #Получаем даги, родителей(df3) и зависимые(df2) 1ого порядка
-    columns = ['dest_dag_nm', 'source_dag_nm']
-    df2 = get_data('airflow_data.dependency_trees', columns)
-    
-    df3 = df2.withColumnRenamed('dest_dag_nm', 'depend_dag_nm').withColumnRenamed('source_dag_nm', 'dest_dag_nm_1')
-    df3 = df3.distinct().filter(F.col('dest_dag_nm_1').isNotNull())
-    df3 = df3.groupBy('dest_dag_nm_1').agg(F.collect_list('depend_dag_nm').alias('depend_dags_nm'))
-    df3 = df3.drop('depend_dag_nm')
-
-    df2 = df2.distinct()
-    df2 = df2.groupBy('dest_dag_nm').agg(F.collect_list('source_dag_nm').alias('source_dags_nm'))
-    df2 = df2.drop('source_dag_nm')
-
-    #Джойним родителей и зависимые к (dag_id, start_date, end_date, execution_date, execution_end_date, schedule_interval, periodicity)
-    df1 = df1.join(df2, (df1.dag_id == df2.dest_dag_nm), 'left').join(df3, (df1.dag_id == df3.dest_dag_nm_1), 'left')
-    df1 = df1.drop('dest_dag_nm', 'dest_dag_nm_1')
-        
-    #Создаем датафрейм с дагами и планируемым временем
-    df2 = df1.select(F.concat(F.col('dag_id'), F.lit('_'), F.lit('plan')).alias('dag_id'),
-                     'execution_date',
-                     'execution_end_date',
-                     'schedule_interval',
-                     'periodicity', 'source_dags_nm', 'depend_dags_nm')
-    #Убираем лишние колонки
-    df1 = df1.drop('execution_date', 'execution_end_date', 'start_interval', 'end_interval')
-
-    #Обединяем планируемые и реальные даги в один датафрейм
-    df1 = df1.union(df2)
-
-    #Преобразуем в списки родительских и зависимых дагов строки 
-    df1 = df1.withColumn('source_dags', F.concat_ws(' ', 'source_dags_nm')).withColumn('depend_dags', F.concat_ws(' ', 'depend_dags_nm'))
-    df1 = df1.drop('source_dags_nm', 'depend_dags_nm')
-    print(df1.count())
-
-    
-
-    
-    
-
-
-
-    
-    #Записываем в вертику
-    spark = SparkSession.builder.enableHiveSupport().getOrCreate()
-    gw = spark.sparkContext._gateway
-    java_import(gw.jvm, "VerticaDialect")
-    gw.jvm.org.apache.spark.sql.jdbc.JdbcDialects.registerDialect(gw.jvm.VerticaDialect())
-    df1.write.format('jdbc') \
-        .option("url", "jdbc:vertica://10.220.126.48:5433/") \
-        .option("driver", "com.vertica.jdbc.Driver") \
-        .option("dbtable", "public.dags_schedule") \
-        .option("database", "TST") \
-        .option("user", "dbadmin") \
-        .option("password", "TSTpassword") \
-        .mode("append") \
-        .save()
-    
-    
-
+    df = df_from_publicstgdag()
+    df1 = df_from_airflowdatadagrun(date_from, date_to)
+    df2 = df_from_airflowdatadependencytrees()
+    df = result_frame(df1, df, df2)
+    write_to_vertica(df)
+ 
 
 if __name__ == '__main__':
     run()
